@@ -1,0 +1,52 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "payment-api.fullname" . }}
+  labels:
+    app: {{ include "payment-api.name" . }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ include "payment-api.name" . }}
+  # Ingress-only restriction: deny by default, allow only the LB
+  # health-check ranges + same-namespace traffic on the app port.
+  #
+  # Egress is NOT filtered. GKE's Calico NetworkPolicy does not reliably
+  # match egress to link-local IPs (169.254.169.254 / 169.254.20.10) even
+  # with explicit ipBlock rules — iptables DNAT to gke-metadata-server and
+  # node-local DNS cache happens around Calico's filter path. Restricting
+  # egress with Calico in standard GKE breaks Workload Identity AND DNS.
+  # A defense-in-depth egress rule belongs on GKE Dataplane V2 (eBPF) or
+  # a sidecar proxy — out of scope here.
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow GCE LB health checks + serving probes on the app port.
+    - from:
+        {{- range .Values.networkPolicy.allowedIngressCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+    # Allow kubelet probes from the node CIDR (probes originate from the
+    # node IP, not from the LB ranges).
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/24   # dev subnet (node range)
+        - ipBlock:
+            cidr: 10.0.1.0/24   # staging subnet (node range)
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+    # Allow same-namespace traffic (sidecar / future internal callers).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+{{- end }}

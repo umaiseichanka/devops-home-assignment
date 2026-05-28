@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "payment-api.fullname" . }}
+  labels:
+    app: {{ include "payment-api.name" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "payment-api.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "payment-api.name" . }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "payment-api.fullname" .) }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+
+      # Spread pods evenly across nodes (one Spot VM preemption never
+      # empties the pool). Soft preferred — won't block scheduling if
+      # only a single node is available (e.g. early cluster scale-up).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {{ include "payment-api.name" . }}
+
+      # Best-effort: avoid co-locating two payment-api pods on the same
+      # node. Complements topologySpreadConstraints on a 2-node cluster.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: {{ include "payment-api.name" . }}
+                topologyKey: kubernetes.io/hostname
+
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.securityContext.runAsGroup }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+        seccompProfile:
+          type: {{ .Values.securityContext.seccompProfile.type }}
+      containers:
+        - name: payment-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup }}
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+            seccompProfile:
+              type: {{ .Values.securityContext.seccompProfile.type }}
+            capabilities:
+              {{- toYaml .Values.securityContext.capabilities | nindent 14 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                # Give endpoints/LB controller time to remove this pod from
+                # rotation before uvicorn shuts down. Without this, in-flight
+                # requests can return 502 during rolling updates.
+                command: ["/bin/sh", "-c", "sleep {{ .Values.lifecyclePreStopSleepSeconds }}"]
+      volumes:
+        # emptyDir for /tmp — readOnlyRootFilesystem=true blocks writes to /;
+        # Python may need /tmp for *.pyc, multipart uploads, etc.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

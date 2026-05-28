@@ -1,0 +1,9 @@
+# Rename to backend.tf and uncomment after creating the GCS bucket.
+# terraform init -backend-config="bucket=YOUR_BUCKET" -backend-config="prefix=payment-api/dev"
+
+# terraform {
+#   backend "gcs" {
+#     bucket = "your-terraform-state-bucket"
+#     prefix = "payment-api/dev"
+#   }
+# }

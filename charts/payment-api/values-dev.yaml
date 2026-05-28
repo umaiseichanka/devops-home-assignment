@@ -1,0 +1,37 @@
+# Dev — HA at pod level so Spot VM preemption doesn't drop the service.
+# A single Spot reclaim takes ~5-10 min for the new node + image pull; with
+# 2 replicas spread across 2 nodes, the surviving pod keeps serving 100%
+# during that window.
+replicaCount: 2
+
+namespace: payment-api
+
+# Private endpoint cluster: no public LB on dev — expose via Ingress with the
+# reserved global static IP (TF: google_compute_global_address.ingress_ip).
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: ""
+  staticIpName: payment-api-ingress-ip
+  host: ""
+  path: /
+  pathType: Prefix
+
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: payment-api-sa@payment-api-task.iam.gserviceaccount.com
+
+env:
+  GCP_PROJECT_ID: payment-api-task
+  SECRET_NAME: payment-api-key
+
+# Protect against voluntary disruptions (e.g. cluster autoscaler drain
+# during scale-down). minAvailable: 1 with replicaCount: 2 allows one
+# pod to be evicted at a time.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

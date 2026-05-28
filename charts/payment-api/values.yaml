@@ -1,0 +1,125 @@
+# Default values for payment-api. Override per env in values-<env>.yaml.
+
+replicaCount: 1
+
+image:
+  repository: ""   # e.g. europe-west1-docker.pkg.dev/PROJECT/payment-api/payment-api
+  tag: ""          # set by CI to github.sha
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: "payment-api"
+
+namespace: payment-api
+
+serviceAccount:
+  create: true
+  name: payment-api
+  # Annotation binds KSA to GSA (Workload Identity). Set per env in values-<env>.yaml.
+  annotations: {}
+  # iam.gke.io/gcp-service-account: payment-api-sa@PROJECT.iam.gserviceaccount.com
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+# Ingress: GCE HTTP(S) Load Balancer with reserved global static IP from Terraform.
+# Toggle per env. When enabled, set service.type to ClusterIP.
+ingress:
+  enabled: false
+  className: ""              # "" => default GCE ingress controller
+  staticIpName: ""           # name of google_compute_global_address (Terraform output)
+  host: ""                   # optional; leave empty for IP-only access
+  path: /
+  pathType: Prefix
+
+env:
+  GCP_PROJECT_ID: ""        # set by values-<env>.yaml
+  SECRET_NAME: payment-api-key
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+# Memory headroom: FastAPI + uvicorn + opentelemetry SDK + gRPC + Cloud Trace
+# exporter + Secret Manager SDK import ~200-300 MiB resident before any
+# request lands. 256Mi limit caused OOMKill during startup (exitCode 137,
+# zero logs). 512Mi is the comfortable floor for this stack.
+
+# Pod-level securityContext applied to all containers.
+# Tuned for PSA `restricted` enforcement.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop:
+      - ALL
+
+# Startup — gives the secret-load + OTel init time before liveness kicks in.
+# 30 × 5s = 150s total budget before kubelet considers the container failed.
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  failureThreshold: 30
+  periodSeconds: 5
+
+# Liveness — process alive, cheap, no external deps
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  failureThreshold: 3
+
+# Readiness — pod ready to serve (secret loaded, traces ready)
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+
+# Graceful shutdown — uvicorn drains in-flight on SIGTERM. preStop sleep
+# gives the LB/endpoints controller time to remove the pod from rotation
+# before the process exits, avoiding 502s during rolling updates.
+terminationGracePeriodSeconds: 30
+lifecyclePreStopSleepSeconds: 10
+
+# PodDisruptionBudget — prevent voluntary disruptions from emptying the pool.
+# Enable when replicaCount >= 2 (otherwise it blocks node drain).
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# HorizontalPodAutoscaler — scales pods on CPU utilisation.
+# Disabled by default; staging enables it.
+hpa:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+# NetworkPolicy — default-deny ingress, explicit allow from GCE LB health
+# checks and same-namespace traffic. Egress allowed (pod needs Secret
+# Manager / Cloud Trace via Cloud NAT).
+networkPolicy:
+  enabled: true
+  # Google LB health-check + serving ranges
+  allowedIngressCIDRs:
+    - 35.191.0.0/16
+    - 130.211.0.0/22
+    - 209.85.152.0/22
+    - 209.85.204.0/22

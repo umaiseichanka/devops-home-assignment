@@ -1,0 +1,5 @@
+project_id        = "payment-api-task"
+region            = "europe-west1"
+github_repository = "umaiseichanka/devops-home-assignment3"
+alert_email       = "lefetobug@gmail.com"
+health_check_host = "34.117.51.222"

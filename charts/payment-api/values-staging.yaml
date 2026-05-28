@@ -1,0 +1,43 @@
+# Staging — closer to production: HA on pod level + PDB + HPA + Ingress
+replicaCount: 2
+
+namespace: payment-api
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: ""
+  staticIpName: payment-api-ingress-ip   # google_compute_global_address (Terraform)
+  host: ""
+  path: /
+  pathType: Prefix
+
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: payment-api-sa@payment-api-task.iam.gserviceaccount.com
+
+env:
+  GCP_PROJECT_ID: payment-api-task
+  SECRET_NAME: payment-api-key
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 384Mi
+  limits:
+    cpu: 750m
+    memory: 768Mi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70

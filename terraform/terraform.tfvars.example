@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and fill in. Do NOT commit terraform.tfvars.
+
+project_id        = "your-gcp-project-id"
+region            = "europe-west1"
+github_repository = "your-github-username/your-repo-name"
+alert_email       = "your-email@example.com"
+
+# Set after first deploy when you know the external IP / hostname:
+# health_check_host = "1.2.3.4"
+
+# Optional: restrict control plane access to specific CIDRs instead of 0.0.0.0/0
+# master_authorized_networks = [
+#   { cidr_block = "YOUR_IP/32", display_name = "my-laptop" }
+# ]

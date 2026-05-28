@@ -1,0 +1,81 @@
+# Namespace-scoped RBAC for the GitHub Actions CI/CD service account.
+#
+# Combined with `roles/container.clusterViewer` at the IAM layer, this is
+# the canonical "least-privilege CI to GKE" pattern:
+#   - At IAM: GSA can authenticate to the cluster API, read-only globally.
+#   - At K8s RBAC: GSA can CRUD the workloads Helm manages, but only inside
+#     the payment-api namespace. No exec, no port-forward, no token-request,
+#     no access to other namespaces.
+#
+# This file is bootstrap infra (applied once by a project Owner during
+# initial setup) — it is NOT applied by the CI itself, because the CI
+# would need RBAC-write to apply it, defeating the purpose.
+#
+# Bind GKE accepts the GCP service account email as the User identity for
+# Connect Gateway requests.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-deployer
+  namespace: payment-api
+  labels:
+    app.kubernetes.io/managed-by: bootstrap
+rules:
+  # Helm release storage (Helm 3 stores release metadata as Secrets in the
+  # target namespace) + ConfigMaps for any future chart values.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Resources the chart creates directly (Service + ServiceAccount).
+  - apiGroups: [""]
+    resources: ["services", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Pods + events are read-only — Helm watches them during --wait. Pods are
+  # never created directly by Helm (the ReplicaSet controller does that);
+  # write access on pods would also imply pods/exec via subresource policy
+  # ambiguity, which we want to deny.
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log", "pods/status"]
+    verbs: ["get", "list", "watch"]
+
+  # Deployments + ReplicaSets — the application Deployment + its history.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Ingress + NetworkPolicy.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # PDB.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # HPA (chart manages it on staging).
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer
+  namespace: payment-api
+  labels:
+    app.kubernetes.io/managed-by: bootstrap
+subjects:
+  - kind: User
+    name: github-actions-sa@payment-api-task.iam.gserviceaccount.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: ci-deployer
+  apiGroup: rbac.authorization.k8s.io
