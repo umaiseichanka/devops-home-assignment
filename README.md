@@ -2,7 +2,7 @@
 
 GCP environment for a fictional "payment API". GKE-only, Terraform, GitHub Actions CI/CD, Helm-based CD, Cloud Logging/Monitoring/Trace. Production-grade defaults: fully private cluster, Connect Gateway for CI/CD, Workload Identity end-to-end, scoped secret access, PSA `restricted` pods, namespace-scoped K8s RBAC for CI, HA across Spot reclamations.
 
-**Submission:** [github.com/umaiseichanka/devops-home-assignment3](https://github.com/umaiseichanka/devops-home-assignment)
+**Submission:** [github.com/umaiseichanka/devops-home-assignment](https://github.com/umaiseichanka/devops-home-assignment)
 
 ---
 
