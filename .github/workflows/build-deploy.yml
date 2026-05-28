@@ -1,0 +1,274 @@
+name: Build and Deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options: [dev, staging]
+        default: dev
+
+env:
+  GCP_PROJECT_ID: payment-api-task
+  GCP_REGION: europe-west1
+  GCP_ZONE: europe-west1-b
+  GKE_CLUSTER: payment-api-cluster
+  AR_HOST: europe-west1-docker.pkg.dev
+  AR_REPO: payment-api
+  IMAGE_NAME: payment-api
+  HELM_RELEASE: payment-api
+  HELM_NAMESPACE: payment-api
+  HELM_CHART: ./charts/payment-api
+  # Opt in to Node 24 runtime for all JavaScript actions. GitHub forces
+  # Node 24 from 2026-06-02 anyway; setting this silences the deprecation
+  # warning today for actions whose published manifest still says node20
+  # (e.g. actions/upload-artifact@v5). Remove this line once the cutover
+  # date passes.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+permissions:
+  contents: read
+  id-token: write          # required for Workload Identity Federation OIDC
+
+jobs:
+  lint:
+    name: Lint Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+          failure-threshold: error
+
+  build-scan-push:
+    name: Build, Scan, Push
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+      image_tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute image URI
+        id: image
+        run: |
+          TAG="${GITHUB_SHA::12}"
+          URI="${AR_HOST}/${GCP_PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}:${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+
+      # WIF auth + image push only on main / dispatch (WIF condition restricts
+      # to refs/heads/main + workflow_dispatch). PR runs build+scan locally
+      # for the gate, but don't push to the registry.
+      - name: Auth to GCP (WIF)
+        if: github.event_name != 'pull_request'
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        if: github.event_name != 'pull_request'
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure docker for Artifact Registry
+        if: github.event_name != 'pull_request'
+        run: gcloud auth configure-docker "${AR_HOST}" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (local load for scan)
+        uses: docker/build-push-action@v7
+        with:
+          context: app
+          file: app/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.image.outputs.uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan (JSON for summary + gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.uri }}
+          format: json
+          output: trivy-report.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '0'
+
+      # SARIF / GitHub Code Scanning is not used: it requires GitHub
+      # Advanced Security on private repos. The Trivy gate (JSON scan +
+      # `Fail on HIGH/CRITICAL` step below) is the authoritative gate.
+
+      - name: Generate SBOM (CycloneDX)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.uri }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          vuln-type: os,library
+          exit-code: '0'
+
+      - name: Upload SBOM artifact
+        if: always() && hashFiles('sbom.cdx.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ steps.image.outputs.tag }}
+          path: sbom.cdx.json
+          retention-days: 30
+
+      - name: Trivy summary -> $GITHUB_STEP_SUMMARY
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          path = "trivy-report.json"
+          if not os.path.exists(path):
+              print("## Trivy\nNo report file produced.")
+              raise SystemExit
+          data = json.load(open(path))
+          counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
+          findings = []
+          for r in data.get("Results") or []:
+              tgt = r.get("Target", "")
+              for v in r.get("Vulnerabilities") or []:
+                  sev = v.get("Severity", "UNKNOWN")
+                  counts[sev] = counts.get(sev, 0) + 1
+                  if sev in ("CRITICAL", "HIGH"):
+                      findings.append((sev, v.get("PkgName"), v.get("InstalledVersion"),
+                                       v.get("FixedVersion") or "-",
+                                       v.get("VulnerabilityID"), tgt))
+          print("## Trivy scan summary")
+          print()
+          print(f"**Image:** `${{ steps.image.outputs.uri }}`")
+          print()
+          print("| Severity | Count |")
+          print("|---|---|")
+          for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"):
+              print(f"| {sev} | {counts.get(sev,0)} |")
+          if findings:
+              print()
+              print("### HIGH / CRITICAL findings")
+              print()
+              print("| Severity | Package | Installed | Fixed | CVE | Target |")
+              print("|---|---|---|---|---|---|")
+              for f in findings[:30]:
+                  print(f"| {f[0]} | {f[1]} | {f[2]} | {f[3]} | {f[4]} | {f[5]} |")
+              if len(findings) > 30:
+                  print(f"\n_…and {len(findings)-30} more_")
+          else:
+              print()
+              print("**No HIGH or CRITICAL findings.**")
+          PY
+
+      - name: Fail on HIGH/CRITICAL
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          data = json.load(open("trivy-report.json"))
+          bad = 0
+          for r in data.get("Results") or []:
+              for v in r.get("Vulnerabilities") or []:
+                  if v.get("Severity") in ("HIGH", "CRITICAL"):
+                      bad += 1
+          if bad:
+              print(f"::error::Trivy found {bad} HIGH/CRITICAL vulnerabilities", file=sys.stderr)
+              sys.exit(1)
+          print("Trivy: no HIGH/CRITICAL findings.")
+          PY
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: docker push ${{ steps.image.outputs.uri }}
+
+  deploy:
+    name: Helm deploy
+    needs: build-scan-push
+    # Deploy only on main / dispatch — WIF condition restricts token issuance
+    # to refs/heads/main + workflow_dispatch anyway, but gate at the job level
+    # so PRs don't try and burn the budget.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # GitHub Environment provides a second gate independent of WIF:
+    #   - required reviewers / wait timer / deployment branch policy configured
+    #     in repo Settings → Environments → <name>
+    #   - secrets/vars scoped to this environment override repo-level ones
+    # Environment name is taken from workflow_dispatch input; push-to-main
+    # defaults to 'dev'. Configure 'staging' / 'prod' environments with
+    # required reviewers before promoting workflow_dispatch options.
+    environment:
+      name: ${{ inputs.environment || 'dev' }}
+    env:
+      DEPLOY_ENV: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Auth to GCP (WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud + gke-gcloud-auth-plugin
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GCP_ZONE }}
+          use_connect_gateway: ${{ vars.USE_CONNECT_GATEWAY == 'true' }}
+          fleet_membership_name: ${{ vars.USE_CONNECT_GATEWAY == 'true' && format('projects/{0}/locations/global/memberships/{1}', env.GCP_PROJECT_ID, env.GKE_CLUSTER) || '' }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.15.4
+
+      # Namespace + namespace-scoped RBAC are bootstrap infra applied once
+      # by a project Owner (see k8s/namespace.yaml + k8s/rbac-ci.yaml).
+      # CI now has only `roles/container.clusterViewer` at the IAM layer
+      # and `Role/ci-deployer` in the payment-api namespace — it cannot
+      # create namespaces, RoleBindings, or touch other namespaces.
+
+      - name: Helm upgrade --install (atomic, auto-rollback on failure)
+        id: helm
+        run: |
+          helm upgrade --install "${HELM_RELEASE}" "${HELM_CHART}" \
+            --namespace "${HELM_NAMESPACE}" \
+            -f "${HELM_CHART}/values.yaml" \
+            -f "${HELM_CHART}/values-${DEPLOY_ENV}.yaml" \
+            --set "image.repository=${AR_HOST}/${GCP_PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}" \
+            --set "image.tag=${{ needs.build-scan-push.outputs.image_tag }}" \
+            --atomic --wait --timeout 5m
+
+      - name: Rollback on failure (guarded)
+        if: failure() && steps.helm.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          # Guard: `helm rollback 0` fails when there is no previous revision
+          # (first install). Skip rollback in that case; --atomic has already
+          # cleaned up the failed install.
+          revs=$(helm history "${HELM_RELEASE}" -n "${HELM_NAMESPACE}" -o json 2>/dev/null | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' || echo 0)
+          if [ "$revs" -ge 2 ]; then
+            echo "Helm release failed — rolling back to previous revision (${revs} revisions in history)"
+            helm rollback "${HELM_RELEASE}" 0 --namespace "${HELM_NAMESPACE}" --wait --timeout 5m
+          else
+            echo "Helm release failed on first install — no previous revision to roll back to (--atomic already cleaned up)"
+          fi
+          exit 1
